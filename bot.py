@@ -397,7 +397,8 @@ def source_urls():
 
 
 def seconds_to_reset():
-    """Через сколько секунд ближайшая смена стока (по данным API) или None."""
+    """Через сколько секунд ближайшая смена стока (по данным API) или None.
+    Может быть отрицательным — это значит, что смена уже должна была произойти."""
     try:
         ts = [datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp() for v in _cache["resets"].values()]
     except Exception:
@@ -406,13 +407,11 @@ def seconds_to_reset():
 
 
 def cache_fresh(max_age):
+    """Кэш свежий, только если он моложе max_age секунд.
+    (Раньше здесь был ещё запрет ходить в API до времени смены — из-за него сток «залипал».)"""
     if not _cache["sections"]:
         return False
-    if time.time() - _cache["ts"] < max_age:
-        return True
-    # сток меняется только по таймеру: пока смены не было, лишний раз API не дёргаем
-    left = seconds_to_reset()
-    return left is not None and left > 0
+    return time.time() - _cache["ts"] < max_age
 
 
 async def fetch_stock(max_age=None):
@@ -935,7 +934,7 @@ async def adm_url_test(cb: CallbackQuery):
 @admin.callback_query(F.data == "adm:url_reset")
 async def adm_url_reset(cb: CallbackQuery, state: FSMContext):
     del_setting("stock_url")
-    _cache.update(sections={}, ts=0.0)
+    _cache.update(sections={}, resets={}, ts=0.0)
     await cb.answer("♻️ Сброшено")
     await admin_home(cb, state)
 
@@ -946,7 +945,7 @@ async def got_url(m: Message, state: FSMContext):
     if not re.match(r"^https?://\S+$", url):
         return await m.answer("⚠️ Нужна ссылка, начинающаяся с http:// или https://")
     set_setting("stock_url", url)
-    _cache.update(sections={}, ts=0.0)
+    _cache.update(sections={}, resets={}, ts=0.0)
     await state.clear()
     wait = await m.answer("⏳ Проверяю…")
     res = await probe(url)
@@ -1078,8 +1077,11 @@ async def watcher(bot: Bot):
             log.exception("watcher error")
         delay = CHECK_INTERVAL
         left = seconds_to_reset()
-        if left is not None and 0 < left < CHECK_INTERVAL:
-            delay = left + 5  # проснуться сразу после смены стока
+        if left is not None:
+            if 0 < left < CHECK_INTERVAL:
+                delay = left + 5      # проснуться сразу после смены стока
+            elif -300 < left <= 0:
+                delay = 20            # смена прошла, а данные ещё старые: проверяем чаще
         await asyncio.sleep(delay)
 
 
