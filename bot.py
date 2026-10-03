@@ -33,8 +33,14 @@ STOCK_URLS = [                # источники стока: бот пробу
     "https://api.parse.bot/scraper/e534d388-6640-4c19-b9b6-b2ba12930793/get_stock",
     # "https://другой-api.example.com/stock",   ← запасные источники добавляй сюда
 ]                             # (ссылку, заданную в админке, бот пробует первой)
-CHECK_INTERVAL = 120        # как часто (сек) проверять смену стока для уведомлений
-CACHE_SECONDS = 90          # сколько секунд держать полученный сток в кэше
+# ── экономия кредитов API: бот ходит в API только когда это реально нужно ──
+CACHE_SECONDS = 300         # если API не отдаёт время смены стока — сколько сек держать сток в кэше
+STALE_CAP = 3600            # потолок: пока смена не наступила, кэш живёт не дольше (сек) — защита от «залипания»
+FORCE_MIN_AGE = 600         # кнопка «Обновить» не дёргает API, если данным меньше стольких секунд
+FAIL_PAUSE = 120            # если все ключи/источники дали ошибку — столько сек не пробовать снова
+CHECK_INTERVAL = 60         # после времени смены, пока сток ещё старый: первая пауза до повтора (сек), дальше ×2
+RETRY_CAP = 900             # потолок паузы между повторами после смены стока (сек)
+NO_RESET_INTERVAL = 600     # как часто проверять сток для уведомлений, если API не отдаёт время смены (сек)
 NOTIFY_BY_DEFAULT = True    # автоуведомления включены с самого начала (потом переключаются в админке)
 SHOW_PRICES = True          # показывать цены, если API их отдаёт
 DB_PATH = "fruitstock.db"   # файл базы данных
@@ -307,6 +313,13 @@ def cooldown_left(uid, kind, seconds):
 # ═══════════════════════════ ПОЛУЧЕНИЕ СТОКА ═══════════════════════════
 _cache = {"sections": {}, "resets": {}, "ts": 0.0}
 _fetch_lock = asyncio.Lock()
+_fail = {"ts": 0.0, "err": ""}      # когда и почему в последний раз не удалось получить сток
+_stats = {"calls": 0}               # сколько запросов к API сделано с запуска (каждый ключ считается отдельно)
+
+
+def reset_cache():
+    _cache.update(sections={}, resets={}, ts=0.0)
+    _fail["ts"] = 0.0
 # ключи: переменная окружения STOCK_API_KEYS (через запятую) главнее списка из настроек
 if os.getenv("STOCK_API_KEYS") or os.getenv("STOCK_API_KEY"):
     STOCK_API_KEYS = (os.getenv("STOCK_API_KEYS") or os.getenv("STOCK_API_KEY")).split(",")
@@ -397,8 +410,7 @@ def source_urls():
 
 
 def seconds_to_reset():
-    """Через сколько секунд ближайшая смена стока (по данным API) или None.
-    Может быть отрицательным — это значит, что смена уже должна была произойти."""
+    """Через сколько секунд ближайшая смена стока (по данным API) или None."""
     try:
         ts = [datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp() for v in _cache["resets"].values()]
     except Exception:
@@ -406,23 +418,35 @@ def seconds_to_reset():
     return (min(ts) - time.time()) if ts else None
 
 
-def cache_fresh(max_age):
-    """Кэш свежий, только если он моложе max_age секунд.
-    (Раньше здесь был ещё запрет ходить в API до времени смены — из-за него сток «залипал».)"""
+def cache_fresh(max_age, ignore_reset=False):
+    """Можно ли обойтись без запроса к API (каждый запрос тратит кредиты)."""
     if not _cache["sections"]:
         return False
-    return time.time() - _cache["ts"] < max_age
+    age = time.time() - _cache["ts"]
+    if age < max_age:
+        return True
+    if ignore_reset:
+        return False
+    # сток меняется только по таймеру: пока смена не наступила, API не дёргаем (но не дольше STALE_CAP)
+    left = seconds_to_reset()
+    return left is not None and left > 0 and age < STALE_CAP
 
 
-async def fetch_stock(max_age=None):
-    """→ (sections, error|None, timestamp). Пробует источники по очереди; при полном сбое отдаёт сохранённое."""
+async def fetch_stock(max_age=None, force=False):
+    """→ (sections, error|None, timestamp). Пробует источники по очереди; при полном сбое отдаёт сохранённое.
+    force=True («Обновить»): игнорирует время смены, но всё равно не чаще раза в FORCE_MIN_AGE секунд."""
     max_age = CACHE_SECONDS if max_age is None else max_age
     async with _fetch_lock:
-        if cache_fresh(max_age):
+        fresh = cache_fresh(FORCE_MIN_AGE, ignore_reset=True) if force else cache_fresh(max_age)
+        if fresh:
             return _cache["sections"], None, _cache["ts"]
+        if time.time() - _fail["ts"] < FAIL_PAUSE:      # недавно всё упало — не жжём кредиты повторными попытками
+            return _cache["sections"], _fail["err"], _cache["ts"]
         errors = []
         for url in source_urls():
             for key in key_attempts(url):
+                _stats["calls"] += 1
+                log.info("Запрос к API №%d (ключ: %s)", _stats["calls"], mask_key(key))
                 try:
                     async with aiohttp.ClientSession(headers=headers_for(url, key)) as s:
                         async with s.get(url, timeout=aiohttp.ClientTimeout(total=45)) as r:
@@ -438,16 +462,20 @@ async def fetch_stock(max_age=None):
                     if key in STOCK_API_KEYS:
                         _good_key["i"] = STOCK_API_KEYS.index(key)
                     _cache.update(sections=sections, resets=resets, ts=time.time())
+                    _fail["ts"] = 0.0
                     return sections, None, _cache["ts"]
                 except Exception as e:
                     log.warning("Источник %s (ключ: %s) не сработал: %s", url, mask_key(key), e)
                     errors.append(f"{url} [{mask_key(key)}]: {e}")
-        return _cache["sections"], "; ".join(errors) or "нет источников", _cache["ts"]
+        err = "; ".join(errors) or "нет источников"
+        _fail.update(ts=time.time(), err=err)
+        return _cache["sections"], err, _cache["ts"]
 
 
 async def probe(url, chars=500):
     notes = []
     for key in key_attempts(url):
+        _stats["calls"] += 1
         label = f"🔑 {esc(mask_key(key))}\n" if key else ""
         try:
             async with aiohttp.ClientSession(headers=headers_for(url, key)) as s:
@@ -630,7 +658,7 @@ async def render_stock(target, uid, force=False, answer=True):
         return
     if answer and isinstance(target, CallbackQuery):
         await target.answer(T["loading"])
-    sections, err, ts = await fetch_stock(max_age=15 if force else None)
+    sections, err, ts = await fetch_stock(force=force)
     await show(target, stock_text(sections, err, ts), stock_kb(uid))
 
 
@@ -934,7 +962,7 @@ async def adm_url_test(cb: CallbackQuery):
 @admin.callback_query(F.data == "adm:url_reset")
 async def adm_url_reset(cb: CallbackQuery, state: FSMContext):
     del_setting("stock_url")
-    _cache.update(sections={}, resets={}, ts=0.0)
+    reset_cache()
     await cb.answer("♻️ Сброшено")
     await admin_home(cb, state)
 
@@ -945,7 +973,7 @@ async def got_url(m: Message, state: FSMContext):
     if not re.match(r"^https?://\S+$", url):
         return await m.answer("⚠️ Нужна ссылка, начинающаяся с http:// или https://")
     set_setting("stock_url", url)
-    _cache.update(sections={}, resets={}, ts=0.0)
+    reset_cache()
     await state.clear()
     wait = await m.answer("⏳ Проверяю…")
     res = await probe(url)
@@ -973,7 +1001,8 @@ async def adm_stats(cb: CallbackQuery):
         f"👥 Пользователей: <b>{total}</b>\n🔔 Подписано на уведомления: <b>{subs}</b>\n🚫 В бане: <b>{banned}</b>\n\n"
         f"🍎 Фруктов в базе: <b>{fr}</b>, со своим эмодзи: <b>{fe}</b>\n"
         f"🖼 Картинка меню: {'есть' if get_setting('menu_photo') else 'нет'}\n"
-        f"🔔 Автоуведомления: {'вкл' if notify_enabled() else 'выкл'}",
+        f"🔔 Автоуведомления: {'вкл' if notify_enabled() else 'выкл'}\n"
+        f"📡 Запросов к API с запуска: <b>{_stats['calls']}</b>",
         kb([(AB["back"], "adm")]),
     )
 
@@ -1061,27 +1090,32 @@ async def broadcast_stock(bot: Bot, sections):
 
 
 async def watcher(bot: Bot):
+    """Спит до времени смены стока и просыпается сразу после неё — а не опрашивает API по таймеру."""
     await asyncio.sleep(5)
+    retry = 0
     while True:
         try:
             if notify_enabled():
-                sections, err, _ = await fetch_stock(max_age=max(CHECK_INTERVAL - 5, 1))
+                sections, err, _ = await fetch_stock(max_age=30)
                 if sections and not err:
                     sig = json.dumps({k: sorted(fkey(i["name"]) for i in v) for k, v in sections.items()}, sort_keys=True)
                     last = get_setting("last_sig")
                     if sig != last:
                         set_setting("last_sig", sig)
+                        retry = 0
                         if last:  # при самом первом запуске не рассылаем
                             await broadcast_stock(bot, sections)
         except Exception:
             log.exception("watcher error")
-        delay = CHECK_INTERVAL
         left = seconds_to_reset()
-        if left is not None:
-            if 0 < left < CHECK_INTERVAL:
-                delay = left + 5      # проснуться сразу после смены стока
-            elif -300 < left <= 0:
-                delay = 20            # смена прошла, а данные ещё старые: проверяем чаще
+        if left is None:
+            delay = NO_RESET_INTERVAL                      # API не говорит, когда смена — проверяем редко
+        elif left > 0:
+            retry = 0
+            delay = min(left + 5, STALE_CAP)               # спим до смены стока
+        else:
+            delay = min(CHECK_INTERVAL * 2 ** retry, RETRY_CAP)   # смена была, а данные старые: повторы всё реже
+            retry += 1
         await asyncio.sleep(delay)
 
 
